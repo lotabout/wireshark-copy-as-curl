@@ -19,6 +19,6 @@ Put the `copy_as_curl.lua` file in the [Personal Plugin folders](https://www.wir
 
 A list of the folders Wireshark actually uses can be found under the Folders tab in the dialog box shown when you select About Wireshark from the Help menu.
 
-## Limits
+## Limitations
 
 - Only json payload and mutipart are considered for now.

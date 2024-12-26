@@ -29,6 +29,31 @@ function split_into_lines(input, line_length)
     return lines
 end
 
+-- escape form string fields
+-- `@x"xx` -> `"@x\"xx"` (with double quotes)
+-- `<x'xx` -> `"<x'xx"` (with double quotes)
+-- `'` -> `'"'"'` (single quote escaped by double quotes for bash)
+local function escape_form_string_field(field)
+    local ret = field
+    if field:find('^[@<]') then
+        ret = '"' .. field:gsub('"', '\\"') .. '"'
+    end
+    return ret:gsub("'", "'\"'\"'")
+end
+
+-- escape form file name
+-- `xx,x"x` -> `"xx,x\"x"` (with double quotes)
+-- `xx;x"x` -> `"xx;x\"x"` (with double quotes)
+-- `'` -> `'"'"'` (single quote escaped by double quotes for bash)
+local function escape_form_file_name(file_name)
+    local ret = file_name
+    if file_name:find('[,;]') then
+        ret = '"' .. file_name:gsub('"', '\\"') .. '"'
+    end
+    return ret:gsub("'", "'\"'\"'")
+end
+
+
 -- Function to extract HTTP fields and generate cURL command
 local function generate_curl_command(...)
     local fields = {...}
@@ -38,7 +63,8 @@ local function generate_curl_command(...)
     for i, field in ipairs( fields ) do
         if field.name == 'http.request.line' and field.value then
             if field.value:find('^Host:') == nil and
-                field.value:find('^Content-Length:') == nil then
+                field.value:find('^Content%-Length:') == nil and
+                field.value:find('^Content%-Type: multipart/form%-data;') == nil then
                 table.insert(headers, field.value)
             end
         end
@@ -52,41 +78,86 @@ local function generate_curl_command(...)
         end
     end
 
-    -- for multipart data, the generated command will be like:
-    --
-    -- base64 -d << EOF | curl <other options> --data-binary @-
-    -- <base64 encoded data>
-    -- EOF
-    --
-    --
-    -- for json data, the generated command will be like:
-    --
-    -- curl <other options> -d '<json data>'
-    
-    local cmd_builder = {}
+    -- parse Form/mime_multipart Data
+    local form_field_map = {}
+    local files_to_dump = {}
+    local num_of_files_to_dump = 1
+    local pending_form_name = nil
+    local pending_form_filename = nil
+    local pending_content_type = nil
+    for i, field in ipairs( fields ) do
+        print(field.name, field.value)
+        -- parse next field name
+        if field.name == 'mime_multipart.header.content-disposition' then
+            local content_disposition = field.value
+            pending_form_name = content_disposition:match('name="([^"]+)"')
+            pending_form_filename = content_disposition:match('filename="([^"]+)"')
+        end
 
-    local curl_cmd_prefix = ''
-    if field_map['mime_multipart'] then
-        curl_cmd_prefix = 'base64 -d << EOF | '
+        if field.name == 'mime_multipart.header.content-type' and pending_form_filename then
+            pending_content_type = field.value
+        end
+
+        -- parse next field data (might be string field or binary field)
+        if field.name == 'data.data' and pending_form_name then
+            if pending_form_filename then
+                -- binary field, need to dump the file to a temp file
+                -- new tmp file name (with type and filename), e.g.
+                local file_name = '/tmp/wireshark-curl-' .. num_of_files_to_dump .. '-' .. pending_form_filename
+
+                -- name=@/tmp/wireshark-curl-1-xxx.jpg;filename=xxx.jpg;type=image/jpeg
+                local form_value = '@' .. file_name ..  ';filename=' .. escape_form_file_name(pending_form_filename)
+                if pending_content_type then
+                    form_value = form_value .. ';type=' .. pending_content_type
+                end
+
+                files_to_dump[file_name] = field.value
+                form_field_map[pending_form_name] = form_value
+
+                -- prepare for next form field
+                num_of_files_to_dump = num_of_files_to_dump + 1
+                pending_form_name = nil
+                pending_form_filename = nil
+                pending_content_type = nil
+            else
+                -- string field
+                form_field_map[pending_form_name] = escape_form_string_field(field.value:raw())
+            end
+        end
     end
 
-    table.insert(cmd_builder, curl_cmd_prefix .. 'curl -X ' .. field_map['http.request.method'] .. ' \'' .. field_map['http.host'] .. field_map['http.request.uri'] .. '\'')
+    -- generate commands
+    local commands = {}
+
+    -- generate file dump commands
+    for file_name, file_content in pairs(files_to_dump) do
+        local encoded_data = base64_encode(file_content:raw())
+        local splited_into_80 = split_into_lines(encoded_data, 80)
+        table.insert(commands, 'base64 -d << EOF > ' .. file_name .. '\n' .. table.concat(splited_into_80, '\n') .. '\nEOF')
+    end
+
+    -- generate curl command
+
+    local curl_cmd = {}
+    table.insert(curl_cmd, 'curl -X ' .. field_map['http.request.method'] .. ' \'' .. field_map['http.host'] .. field_map['http.request.uri'] .. '\'')
 
     -- insert headers
     for i, header in ipairs( headers ) do
-        table.insert(cmd_builder, '-H \'' .. string.gsub(header, '%s+$', '') .. '\'')
+        table.insert(curl_cmd, '-H \'' .. string.gsub(header, '%s+$', '') .. '\'')
     end
 
     -- insert payload
     if field_map['json.object'] then
-        table.insert(cmd_builder, '-d \'' .. field_map['json.object'] .. '\'')
-    elseif field_map['mime_multipart'] then
-        local encoded_data = base64_encode(field_map['mime_multipart']:raw())
-        local splited_into_80 = split_into_lines(encoded_data, 80)
-        table.insert(cmd_builder, '--data-binary @-\n' .. table.concat(splited_into_80, '\n') .. '\nEOF')
+        -- insert the json object
+        table.insert(curl_cmd, '-d \'' .. field_map['json.object'] .. '\'')
     end
 
-    copy_to_clipboard(table.concat(cmd_builder, ' \\\n'))
+    for form_name, form_value in pairs(form_field_map) do
+        table.insert(curl_cmd, '-F \'' .. form_name .. '=' .. form_value .. '\'')
+    end
+
+    table.insert(commands, table.concat(curl_cmd, ' \\\n'))
+    copy_to_clipboard(table.concat(commands, '\n\n'))
 end -- end of generate_curl_command
 
 -- Register the menu item under HTTP protocol
