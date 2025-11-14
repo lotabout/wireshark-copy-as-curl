@@ -139,7 +139,7 @@ local function generate_curl_command(...)
     -- generate curl command
 
     local curl_cmd = {}
-    table.insert(curl_cmd, 'curl -X ' .. field_map['http.request.method'] .. ' \'' .. field_map['http.host'] .. field_map['http.request.uri'] .. '\'')
+    table.insert(curl_cmd, 'curl -X ' .. field_map['http.request.method'] .. ' \'' .. field_map['ip.dst_host'] .. ':' .. field_map['tcp.dstport'] .. field_map['http.request.uri'] .. '\'')
 
     -- insert headers
     for i, header in ipairs( headers ) do
